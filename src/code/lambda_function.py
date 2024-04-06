@@ -1,8 +1,10 @@
 import json, tempfile, time, os, mysql.connector, boto3, botocore, logging, pytz
 from pyzbar.pyzbar import decode
 from pdf2image import convert_from_path
+from pdf2image.exceptions import PDFPageCountError
 from datetime import datetime
 from urllib.parse import unquote_plus
+from PIL import Image
 
 S3 = boto3.client('s3', 'eu-west-1', config=botocore.config.Config(s3={'addressing_style':'path'}))
 DB_USER = os.environ.get('DB_USER')
@@ -29,7 +31,7 @@ def check_doc_type_letter(letters: str) -> bool:
 
 # Check the number of character for the entity reference. In dossier-c2e, this one is necessary to find the good entity
 def check_reference(reference: str) -> bool:
-    if len(reference) >= 14:
+    if len(reference) >= 14 and not 'http' in reference:
         return True
     return False
 
@@ -82,71 +84,91 @@ def handler(event, context):
     # Get the document name from the S3 key
     doc_name = key.split('/')[-1]
     str_datetime_now = datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S")
+    data = {
+            'document_id': doc_name.split('-')[0],
+            'hashedDocumentName': doc_name,
+    }
+    document_qr_decode = find_document_qr_decode(data)
+    document_qr_decode.update({
+        'updatedAt': str_datetime_now,
+    })
+    if document_qr_decode['decoded'] == 1 :
+        logger.info(f"## Document ID {document_qr_decode['document_id']} already decoded")
+        return {
+            'statusCode': 200,
+            'body': json.dumps(document_qr_decode, default=str)
+        }
+        
     try: 
         # Download the file from S3 to temp name
         temp = '/tmp/{}'.format(str(time.time()))
+        to_decode = True
         logger.info(f'## Download S3 file at tmp path : {temp}')
         S3.download_file(bucket, key, temp)
         # Convert the file to img to use the decode
         logger.info('## Convert file to img')
-        with tempfile.TemporaryDirectory() as path:
-            images_from_path = convert_from_path(temp, output_folder=path)
+        try:
+            with tempfile.TemporaryDirectory() as path:
+                images_from_path = convert_from_path(temp, output_folder=path)
+        except PDFPageCountError as e:
+            try: 
+                logger.info('## Try to open the file as an image')
+                images_from_path = [Image.open(temp)]
+            except Exception as e:
+                to_decode = False
         i = 1
-        for image in images_from_path:
-            data = {
-                'document_id': doc_name.split('-')[0],
-                'hashedDocumentName': doc_name,
-            }
-            document_qr_decode = find_document_qr_decode(data)
-            if document_qr_decode['decoded'] == 1 :
-                logger.info(f"## Document ID {document_qr_decode['document_id']} already decoded")
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps(document_qr_decode, default=str)
-                }
-            document_qr_decode.update({
-                'updatedAt': str_datetime_now,
-            })
+        if to_decode:
             logger.info(f'## Check image {i} to decode')
-            qr = decode(image)
-            if len(qr) > 0:
-                for code in qr:
-                    logger.info(f'## Image {i} decoded')
-                    data_list = code.data.decode('UTF-8').split(' ')
-                    if is_valid_document_data(data_list):
-                        document_qr_decode.update({
-                            'decoded': 1, 
-                            'decodedAt': str_datetime_now,
-                            'documentTypeLetters': data_list[0], 
-                            'reference': data_list[1],
-                            'entityLetter': data_list[2]
-                        })
-                    elif is_valid_document_reference(data_list):
-                        document_qr_decode.update({
-                            'decoded': 1,
-                            'decodedAt': str_datetime_now,
-                            'reference': data_list[0]
-                        })
+            for image in images_from_path:
+                qr = decode(image)
+                if len(qr) > 0:
+                    for code in qr:
+                        logger.info(f'## Image {i} decoded')
+                        data_list = code.data.decode('UTF-8').split(' ')
+                        if is_valid_document_data(data_list):
+                            document_qr_decode.update({
+                                'decoded': 1, 
+                                'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
+                                'documentTypeLetters': data_list[0], 
+                                'reference': data_list[1],
+                                'entityLetter': data_list[2]
+                            })
+                        elif is_valid_document_reference(data_list):
+                            document_qr_decode.update({
+                                'decoded': 1,
+                                'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
+                                'reference': data_list[0]
+                            })
 
-            if 0 == document_qr_decode['decoded'] and i == len(images_from_path):
-                logger.info(f'## Image {i} not decoded')
-                document_qr_decode.update({
-                    'decoded': 1,
-                    'decodedAt': str_datetime_now,
-                })
-            
-            if 1 == document_qr_decode['decoded'] :
-                logger.info('## Update to DB : %s', document_qr_decode)
-                update_to_db(document_qr_decode)
-                # display the return in bucket logs
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps(document_qr_decode, default=str)
-                }
-            
-            image.close()
-            i = i + 1
-            
-        os.remove(temp)
+                if 0 == document_qr_decode['decoded'] and i == len(images_from_path):
+                    logger.info(f'## Image {i} not decoded')
+                    document_qr_decode.update({
+                        'decoded': 1,
+                        'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                
+                if 1 == document_qr_decode['decoded'] :
+                    logger.info('## Document decoded')
+                    image.close()
+                    break
+                   
+                image.close()
+                i = i + 1
+        else:
+            logger.info('## No image to decode')
+            raise Exception('No image to decode')
     except Exception as e:
-        raise e
+        logger.error(f'## Error : {e}')
+        document_qr_decode.update({
+            'decoded': 1,
+            'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    finally:
+        os.remove(temp)        
+        logger.info('## Update to DB : %s', document_qr_decode)
+        update_to_db(document_qr_decode)
+        return {
+            'statusCode': 200,
+            'body': json.dumps(document_qr_decode, default=str)
+        }
+    
