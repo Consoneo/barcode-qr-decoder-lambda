@@ -74,6 +74,47 @@ def update_to_db(document_qr_decode: dict) -> None:
         cursor.execute(get_sql_update(document_qr_decode))
     cnx.commit()
     cnx.close()
+    
+def interpret_qr_code(qr: list, document_qr_decode: dict) -> dict:
+    for code in qr:
+        logger.info(f'## First image decoded')
+        data_list = code.data.decode('UTF-8').split(' ')
+        if is_valid_document_data(data_list):
+            document_qr_decode.update({
+                'decoded': 1, 
+                'decodedAt': get_datetime_now(),
+                'documentTypeLetters': data_list[0], 
+                'reference': data_list[1],
+                'entityLetter': data_list[2]
+            })
+        elif is_valid_document_reference(data_list):
+            document_qr_decode.update({
+                'decoded': 1,
+                'decodedAt': get_datetime_now(),
+                'reference': data_list[0]
+            })
+    return document_qr_decode    
+
+def get_datetime_now() -> str:
+    return datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S")
+
+def decode_process(image: Image, document_qr_decode: dict) -> dict:
+    logger.info(f'## Check first image to decode')
+    qr = decode(image)
+    if len(qr) > 0:
+        document_qr_decode = interpret_qr_code(qr, document_qr_decode)
+
+    if 0 == document_qr_decode['decoded']:
+        logger.info(f'## First image not decoded')
+        document_qr_decode.update({
+            'decoded': 1,
+            'decodedAt': get_datetime_now(),
+        })
+    else:
+        logger.info('## Document decoded')
+                
+    image.close()
+    return document_qr_decode
 
 # Method used by AWS Lambda
 def handler(event, context):
@@ -83,22 +124,17 @@ def handler(event, context):
     logger.info(f'## Handle document with key : {key}')
     # Get the document name from the S3 key
     doc_name = key.split('/')[-1]
-    str_datetime_now = datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S")
     data = {
-            'document_id': doc_name.split('-')[0],
-            'hashedDocumentName': doc_name,
+        'document_id': doc_name.split('-')[0],
+        'hashedDocumentName': doc_name,
     }
     document_qr_decode = find_document_qr_decode(data)
-    document_qr_decode.update({
-        'updatedAt': str_datetime_now,
-    })
     if document_qr_decode['decoded'] == 1 :
         logger.info(f"## Document ID {document_qr_decode['document_id']} already decoded")
         return {
             'statusCode': 200,
             'body': json.dumps(document_qr_decode, default=str)
         }
-        
     try: 
         # Download the file from S3 to temp name
         temp = '/tmp/{}'.format(str(time.time()))
@@ -109,51 +145,16 @@ def handler(event, context):
         logger.info('## Convert file to img')
         try:
             with tempfile.TemporaryDirectory() as path:
-                images_from_path = convert_from_path(temp, output_folder=path)
+                images_from_path = convert_from_path(temp, output_folder=path, first_page=1, last_page =1)
         except PDFPageCountError as e:
             try: 
                 logger.info('## Try to open the file as an image')
                 images_from_path = [Image.open(temp)]
             except Exception as e:
                 to_decode = False
-        i = 1
-        if to_decode:
-            logger.info(f'## Check image {i} to decode')
-            for image in images_from_path:
-                qr = decode(image)
-                if len(qr) > 0:
-                    for code in qr:
-                        logger.info(f'## Image {i} decoded')
-                        data_list = code.data.decode('UTF-8').split(' ')
-                        if is_valid_document_data(data_list):
-                            document_qr_decode.update({
-                                'decoded': 1, 
-                                'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
-                                'documentTypeLetters': data_list[0], 
-                                'reference': data_list[1],
-                                'entityLetter': data_list[2]
-                            })
-                        elif is_valid_document_reference(data_list):
-                            document_qr_decode.update({
-                                'decoded': 1,
-                                'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
-                                'reference': data_list[0]
-                            })
 
-                if 0 == document_qr_decode['decoded'] and i == len(images_from_path):
-                    logger.info(f'## Image {i} not decoded')
-                    document_qr_decode.update({
-                        'decoded': 1,
-                        'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                
-                if 1 == document_qr_decode['decoded'] :
-                    logger.info('## Document decoded')
-                    image.close()
-                    break
-                   
-                image.close()
-                i = i + 1
+        if to_decode:
+            decode_process(images_from_path[0], document_qr_decode)
         else:
             logger.info('## No image to decode')
             raise Exception('No image to decode')
@@ -161,14 +162,14 @@ def handler(event, context):
         logger.error(f'## Error : {e}')
         document_qr_decode.update({
             'decoded': 1,
-            'decodedAt': datetime.now().astimezone(pytz.timezone('Europe/Paris')).strftime("%Y-%m-%d %H:%M:%S"),
+            'decodedAt': get_datetime_now(),
         })
     finally:
         os.remove(temp)        
         logger.info('## Update to DB : %s', document_qr_decode)
+        document_qr_decode.update({'updatedAt': get_datetime_now()})
         update_to_db(document_qr_decode)
         return {
             'statusCode': 200,
             'body': json.dumps(document_qr_decode, default=str)
         }
-    
