@@ -52,19 +52,29 @@ def is_valid_document_reference(data: list) -> bool:
 def get_sql_update(document_qr_decode: dict) -> str: 
     update_values = ""
     for column,value in document_qr_decode.items():
-        if value != None:
+        if value is not None:
             update_values = update_values + f"`{column}` = '{value}', "
     query = f"UPDATE {DB_TABLE} SET {update_values[:-2]} WHERE document_id = '{document_qr_decode['document_id']}' AND hashedDocumentName = '{document_qr_decode['hashedDocumentName']}'"
     logger.info(f'## Query to update row : {query}')
     return query
 
 def find_document_qr_decode(data: dict) -> dict:
-    query = f"SELECT * FROM {DB_TABLE} WHERE document_id = '{data['document_id']}' AND hashedDocumentName = '{data['hashedDocumentName']}'"
+    query = f"SELECT * FROM {DB_TABLE} WHERE document_id = '{data['document_id']}' AND hashedDocumentName = '{data['hashedDocumentName']}' ORDER BY id DESC;"
     logger.info(f'## Query to find document : {query}')
     cnx = mysql.connector.connect(**DB_CONFIG)
     with cnx.cursor(dictionary=True) as cursor:
         cursor.execute(query)
-        document_qr_decode = cursor.fetchone()
+        documents = cursor.fetchall()
+        document_qr_decode = {}
+        for document in documents:
+            if document['decoded'] == 1:
+                logger.info(f'## Document ID {document["document_id"]} already decoded')
+                continue
+            document_qr_decode = document
+        
+        if not document_qr_decode:
+            document_qr_decode = documents[0]
+            
     cnx.close()
     return document_qr_decode
 
@@ -143,6 +153,7 @@ def handler(event, context):
         S3.download_file(bucket, key, temp)
         # Convert the file to img to use the decode
         logger.info('## Convert file to img')
+        images_from_path = []
         try:
             with tempfile.TemporaryDirectory() as path:
                 images_from_path = convert_from_path(temp, output_folder=path, first_page=1, last_page =1)

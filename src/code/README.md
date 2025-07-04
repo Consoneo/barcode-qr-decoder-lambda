@@ -41,7 +41,7 @@ docker tag docker-image:qrdecode-lambda {xxx}.dkr.ecr.eu-west-1.amazonaws.com/co
 ```
 
 Push your image on AWS
-```
+```shell
 docker push {xxx}.dkr.ecr.eu-west-1.amazonaws.com/consoneo-qrdecode:{tag}
 ```
 
